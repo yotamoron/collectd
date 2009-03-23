@@ -690,6 +690,23 @@ collectd_LDADD += "-dlopen" netapp.la
 collectd_DEPENDENCIES += netapp.la
 endif
 
+if BUILD_PLUGIN_NETCMD
+pkglib_LTLIBRARIES += netcmd.la
+netcmd_la_SOURCES = netcmd.c \
+		      utils_cmd_flush.h utils_cmd_flush.c \
+		      utils_cmd_getval.h utils_cmd_getval.c \
+		      utils_cmd_listval.h utils_cmd_listval.c \
+		      utils_cmd_putval.h utils_cmd_putval.c \
+		      utils_cmd_putnotif.h utils_cmd_putnotif.c
+netcmd_la_LDFLAGS = -module -avoid-version -lpthread
+netcmd_la_LIBADD =
+if BUILD_WITH_LIBSOCKET
+netcmd_la_LIBADD += -lsocket
+endif
+collectd_LDADD += "-dlopen" netcmd.la
+collectd_DEPENDENCIES += netcmd.la
+endif
+
 if BUILD_PLUGIN_NETLINK
 pkglib_LTLIBRARIES += netlink.la
 netlink_la_SOURCES = netlink.c
