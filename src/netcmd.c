@@ -1,6 +1,6 @@
 /**
  * collectd - src/netcmd.c
- * Copyright (C) 2007-2011  Florian octo Forster
+ * Copyright (C) 2007-2012  Florian octo Forster
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -126,6 +126,31 @@ static nc_peer_t *nc_fd_to_peer (int fd) /* {{{ */
 
   return (NULL);
 } /* }}} nc_peer_t *nc_fd_to_peer */
+
+static void nc_free_peer (nc_peer_t *p)
+{
+  size_t i;
+  if (p == NULL)
+    return;
+
+  sfree (p->node);
+  sfree (p->service);
+
+  for (i = 0; i < p->fds_num; i++)
+  {
+    close (p->fds[i]);
+    p->fds[i] = -1;
+  }
+  p->fds_num = 0;
+  sfree (p->fds);
+
+  sfree (p->tls_cert_file);
+  sfree (p->tls_key_file);
+  sfree (p->tls_ca_file);
+  sfree (p->tls_crl_file);
+
+  /* TODO(octo): Clean up TLS stuff. */
+} /* }}} void nc_free_peer */
 
 static int nc_register_fd (nc_peer_t *peer, int fd) /* {{{ */
 {
@@ -846,6 +871,7 @@ static int nc_config_peer (const oconfig_item_t *ci) /* {{{ */
 {
   nc_peer_t *p;
   int i;
+  _Bool success;
 
   p = realloc (peers, sizeof (*peers) * (peers_num + 1));
   if (p == NULL)
@@ -862,7 +888,7 @@ static int nc_config_peer (const oconfig_item_t *ci) /* {{{ */
   p->tls_key_file = NULL;
   p->tls_ca_file = NULL;
   p->tls_crl_file = NULL;
-  p->tls_verify_peer = 1;
+  p->tls_verify_peer = 0;
 
   for (i = 0; i < ci->children_num; i++)
   {
@@ -887,6 +913,26 @@ static int nc_config_peer (const oconfig_item_t *ci) /* {{{ */
           "a \"%s\" block.", child->key, ci->key);
   }
 
+  success = 1;
+
+  if (p->tls_verify_peer
+      && ((p->tls_cert_file == NULL)
+        || (p->tls_key_file == NULL)
+        || (p->tls_ca_file == NULL)))
+  {
+    ERROR ("netcmd plugin: You have requested to verify peers (using the "
+        "\"TLSVerifyPeer\" option), but the TLS setup is incomplete. "
+        "The \"TLSCertFile\", \"TLSKeyFile\" and \"TLSCAFile\" are "
+        "required for this to work. This \"Listen\" block will be disabled.");
+    success = 0;
+  }
+
+  if (!success)
+  {
+    nc_free_peer (p);
+    return (-1);
+  }
+
   DEBUG ("netcmd plugin: node = \"%s\"; service = \"%s\";", p->node, p->service);
 
   peers_num++;
@@ -894,7 +940,7 @@ static int nc_config_peer (const oconfig_item_t *ci) /* {{{ */
   return (0);
 } /* }}} int nc_config_peer */
 
-static int nc_config (oconfig_item_t *ci)
+static int nc_config (oconfig_item_t *ci) /* {{{ */
 {
   int i;
 
@@ -910,9 +956,9 @@ static int nc_config (oconfig_item_t *ci)
   }
 
   return (0);
-} /* int nc_config */
+} /* }}} int nc_config */
 
-static int nc_init (void)
+static int nc_init (void) /* {{{ */
 {
   static int have_init = 0;
 
@@ -940,16 +986,16 @@ static int nc_init (void)
 
   listen_thread_running = 1;
   return (0);
-} /* int nc_init */
+} /* }}} int nc_init */
 
-static int nc_shutdown (void)
+static int nc_shutdown (void) /* {{{ */
 {
-  void *ret;
-
   listen_thread_loop = 0;
 
   if (listen_thread != (pthread_t) 0)
   {
+    void *ret;
+
     pthread_kill (listen_thread, SIGTERM);
     pthread_join (listen_thread, &ret);
     listen_thread = (pthread_t) 0;
@@ -959,7 +1005,7 @@ static int nc_shutdown (void)
   plugin_unregister_shutdown ("netcmd");
 
   return (0);
-} /* int nc_shutdown */
+} /* }}} int nc_shutdown */
 
 void module_register (void)
 {
