@@ -4883,16 +4883,20 @@ number.
 
 This output plugin submits values to a MySQL server. You need first to create
 database and tables on your MySQL server as described in
-F<contrib/write_mysql.sql>.
+F<contrib/write_mysql.sql>. You can do this using:
+
+ mysql -u "${USER}" -p "${DATABASE}" <contrib/write_mysql.sql
 
 Synopsis of the configuration is:
 
  <Plugin write_mysql>
+   <Instance>
      Host "localhost"
      User "root"
      Passwd ""
      Database "collectd"
      Port "3306"
+   </Instance>
  </Plugin>
 
 =over 4
@@ -4916,11 +4920,6 @@ Database where located tables to insert to. Default is collectd.
 =item B<Port> I<Port>
 
 MySQL server port to connect to. Default is 3306.
-
-=item B<Replace> B<true>|B<false>
-
-If B<true>, the I<write_mysql> plugin will replace data into data table.
-Default is true.
 
 =back
 

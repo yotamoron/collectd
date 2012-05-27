@@ -1,6 +1,7 @@
 /**
  * collectd - src/write_mysql.c
  * Copyright (C) 2011-2012  Cyril Feraudet
+ * Copyright (C) 2012       Florian Forster
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the
@@ -18,6 +19,7 @@
  *
  * Authors:
  *   Cyril Feraudet <cyril at feraudet.com>
+ *   Florian Forster <octo at collectd.org>
  **/
 
 #include "collectd.h"
@@ -36,9 +38,6 @@
 
 #include <pthread.h>
 
-static c_avl_tree_t *host_tree, *plugin_tree, *type_tree, *dataset_tree =
-  NULL;
-
 typedef struct dataset_s dataset_t;
 struct dataset_s
 {
@@ -47,465 +46,501 @@ struct dataset_s
   int type_id;
 };
 
-static const char *config_keys[] = {
-  "Host",
-  "User",
-  "Passwd",
-  "Database",
-  "Port",
-  "Replace"
+const char *wm_data_statement = "INSERT INTO data "
+  "(identifier_id, timestamp, value) VALUES (?, ?, ?)";
+struct wm_data_binding_s
+{
+  int identifier_id;
+  MYSQL_TIME timestamp;
+  double value;
+  my_bool value_is_null;
+#define WM_DATA_BINDING_FIELDS_NUM 3
 };
-static int config_keys_num = STATIC_ARRAY_SIZE (config_keys);
+typedef struct wm_data_binding_s wm_data_binding_t;
 
-static char *host = "localhost";
-static char *user = "root";
-static char *passwd = "";
-static char *database = "collectd";
-static int   port = 0;
-static _Bool replace = 1;
+const char *wm_identifier_statement_select = "SELECT id FROM identifier "
+  "WHERE host = ? AND plugin = ? AND plugin_instance = ? "
+  "AND type = ? AND type_instance = ? AND data_source_name = ?";
+const char *wm_identifier_statement_insert = "INSERT INTO identifier "
+  "(host, plugin, plugin_instance, type, type_instance, "
+  "data_source_name, data_source_type) "
+  "VALUES (?, ?, ?, ?, ?, ?, ?)";
+struct wm_identifier_binding_s
+{
+  char host[DATA_MAX_NAME_LEN];
+  char plugin[DATA_MAX_NAME_LEN];
+  char plugin_instance[DATA_MAX_NAME_LEN];
+  char type[DATA_MAX_NAME_LEN];
+  char type_instance[DATA_MAX_NAME_LEN];
+  char data_source_name[DATA_MAX_NAME_LEN];
+  char data_source_type[DATA_MAX_NAME_LEN];
+#define WM_IDENTIFIER_BINDING_FIELDS_NUM 7
+};
+typedef struct wm_identifier_binding_s wm_identifier_binding_t;
+
+typedef int wm_identifier_cache_entry_t;
+
+struct wm_callback_s
+{
+  char *host;
+  int   port;
+  char *user;
+  char *passwd;
+  char *database;
+
+  MYSQL *conn;
+  pthread_mutex_t conn_lock;
+
+  pthread_mutex_t data_lock;
+  MYSQL_STMT *data_stmt;
+  wm_data_binding_t data_values;
+
+  pthread_mutex_t identifier_lock;
+  c_avl_tree_t *identifier_cache;
+
+  MYSQL_STMT *identifier_stmt_select;
+
+  MYSQL_STMT *identifier_stmt_insert;
+};
+typedef struct wm_callback_s wm_callback_t;
 
 #define HOST_ITEM   0
 #define PLUGIN_ITEM 1
 #define TYPE_ITEM   2
 
-static MYSQL *conn;
-static MYSQL_BIND data_bind[8], notif_bind[8];
-static MYSQL_STMT *data_stmt, *notif_stmt;
-
-static pthread_mutex_t mutexdb;
-static pthread_mutex_t mutexhost_tree, mutexplugin_tree, mutextype_tree,
-  mutexdataset_tree;
-
-static char data_query[1024];
-static const char *notif_query =
-  "INSERT INTO notification  (date,host_id,plugin_id,"
-  "plugin_instance,type_id,type_instance,severity,message) VALUES "
-  "(?,?,?,?,?,?,?,?)";
-
-static int
-write_mysql_config (const char *key, const char *value)
+static void wm_callback_init (wm_callback_t *cb) /* {{{ */
 {
-  if (strcasecmp ("Host", key) == 0)
-    {
-      host = strdup (value);
-    }
-  else if (strcasecmp ("User", key) == 0)
-    {
-      user = strdup (value);
-    }
-  else if (strcasecmp ("Passwd", key) == 0)
-    {
-      passwd = strdup (value);
-    }
-  else if (strcasecmp ("Database", key) == 0)
-    {
-      database = strdup (value);
-    }
-  else if (strcasecmp ("Port", key) == 0)
-    {
-      port = service_name_to_port_number (value);
-    }
-  else if (strcasecmp ("Replace", key) == 0)
-    {
-      replace = IS_TRUE (value);
-    }
-}
+  memset (cb, 0, sizeof (*cb));
 
-static int
-write_mysql_init (void)
+  cb->host = NULL;
+  cb->user = NULL;
+  cb->passwd = NULL;
+  cb->database = NULL;
+  cb->conn = NULL;
+  cb->data_stmt = NULL;
+
+  pthread_mutex_init (&cb->conn_lock, /* attr = */ NULL);
+
+  pthread_mutex_init (&cb->data_lock, /* attr = */ NULL);
+} /* }}} void wm_callback_init */
+
+static int wm_callback_disconnect (wm_callback_t *cb) /* {{{ */
 {
-  my_bool my_true = 1;
-  conn = mysql_init (NULL);
-  if (!mysql_thread_safe ())
-    {
-      ERROR ("write_mysql plugin: mysqlclient Thread Safe OFF");
-      return (-1);
-    }
-  else
-    {
-      DEBUG ("write_mysql plugin: mysqlclient Thread Safe ON");
-    }
-  if (mysql_real_connect (conn, host, user, passwd, database, port, NULL, 0)
-      == NULL)
-    {
-      ERROR ("write_mysql plugin: Failed to connect to database %s "
-	     " at server %s with user %s : %s", database, host, user,
-	     mysql_error (conn));
-    }
-  char tmpquery[1024] = "%s INTO data "
-    "(timestamp,host_id,plugin_id,plugin_instance,type_id,type_instance,dataset_id,value)"
-    "VALUES (?,?,?,?,?,?,?,?)";
-  ssnprintf (data_query, sizeof (tmpquery), tmpquery, replace ? "REPLACE" : "INSERT");
-  mysql_options (conn, MYSQL_OPT_RECONNECT, &my_true);
-  data_stmt = mysql_stmt_init (conn);
-  notif_stmt = mysql_stmt_init (conn);
-  mysql_stmt_prepare (data_stmt, data_query, strlen (data_query));
-  mysql_stmt_prepare (notif_stmt, notif_query, strlen (notif_query));
-  host_tree = c_avl_create ((void *) strcmp);
-  plugin_tree = c_avl_create ((void *) strcmp);
-  type_tree = c_avl_create ((void *) strcmp);
-  dataset_tree = c_avl_create ((void *) strcmp);
+  if (cb->conn == NULL)
+    return (0);
+
+  if (cb->data_stmt != NULL)
+  {
+    mysql_stmt_close (cb->data_stmt);
+    cb->data_stmt = NULL;
+  }
+
+  if (cb->identifier_stmt_select != NULL)
+  {
+    mysql_stmt_close (cb->identifier_stmt_select);
+    cb->identifier_stmt_select = NULL;
+  }
+
+  if (cb->identifier_stmt_insert != NULL)
+  {
+    mysql_stmt_close (cb->identifier_stmt_insert);
+    cb->identifier_stmt_insert = NULL;
+  }
+
+  mysql_close (cb->conn);
+  cb->conn = NULL;
+
   return (0);
-}
+} /* }}} int wm_callback_disconnect */
 
-
-static int
-add_item_id (const char *name, const int item)
+static int wm_callback_connect (wm_callback_t *cb) /* {{{ */
 {
-  int *id = malloc (sizeof (int));
-  char query[1024];
-  pthread_mutex_t *mutex;
-  c_avl_tree_t *tree;
-  MYSQL_BIND param_bind[1], result_bind[1];
-  MYSQL_STMT *stmt;
-  ssnprintf (query, sizeof (query), "SELECT id FROM %s WHERE name = ?",
-	     item == HOST_ITEM ? "host" : item ==
-	     PLUGIN_ITEM ? "plugin" : "type");
-  DEBUG ("write_mysql plugin: %s", query);
-  memset (param_bind, '\0', sizeof (MYSQL_BIND));
-  memset (result_bind, '\0', sizeof (MYSQL_BIND));
+  int status;
+  my_bool flag;
+
+  if (cb->conn != NULL)
+    return (0);
+
+  assert (cb->data_stmt == NULL);
+
+  cb->conn = mysql_init (/* old conn = */ NULL);
+  if (cb->conn == NULL)
+  {
+    ERROR ("write_mysql plugin: mysql_init() failed.");
+    return (-1);
+  }
+
+  flag = (my_bool) 1;
+  mysql_options (cb->conn, MYSQL_OPT_RECONNECT, (void *) &flag);
+  /* TODO: Make this configurable */
+  mysql_options (cb->conn, MYSQL_OPT_COMPRESS, /* unused */ NULL);
+
+  if (mysql_real_connect (cb->conn, cb->host, cb->user, cb->passwd,
+        /* cb->database */ NULL,
+        cb->port,
+        /* unix sock = */ NULL, /* flags = */ 0) == NULL)
+  {
+    ERROR ("write_mysql plugin: mysql_real_connect (%s, %i) failed: %s",
+        cb->host, cb->port, mysql_error (cb->conn));
+    DEBUG ("cb->passwd = %s", cb->passwd);
+    wm_callback_disconnect (cb);
+    return (-1);
+  }
+
+#if 1
+  status = mysql_select_db (cb->conn, cb->database);
+  if (status != 0)
+  {
+    ERROR ("write_mysql plugin: mysql_select_db (%s) failed: %s",
+        cb->database, mysql_error (cb->conn));
+    wm_callback_disconnect (cb);
+    return (-1);
+  }
+#endif
+
+  /* Prepare the data INSERT statement */
+  cb->data_stmt = mysql_stmt_init (cb->conn);
+  if (cb->data_stmt == NULL)
+  {
+    ERROR ("write_mysql plugin: mysql_stmt_init() failed: %s",
+        mysql_error (cb->conn));
+    wm_callback_disconnect (cb);
+    return (-1);
+  }
+
+  status = mysql_stmt_prepare (cb->data_stmt,
+      wm_data_statement, (unsigned long) strlen (wm_data_statement));
+  if (status != 0)
+  {
+    ERROR ("write_mysql plugin: mysql_stmt_prepare(\"%s\") failed: %s",
+        wm_data_statement, mysql_error (cb->conn));
+    wm_callback_disconnect (cb);
+    return (-1);
+  }
+  DEBUG ("write_mysql plugin: Statement prepared: \"%s\"",
+      wm_data_statement);
+
+  /* Prepare the identifier SELECT statement */
+  cb->identifier_stmt_select = mysql_stmt_init (cb->conn);
+  if (cb->identifier_stmt_select == NULL)
+  {
+    ERROR ("write_mysql plugin: mysql_stmt_init() failed: %s",
+        mysql_error (cb->conn));
+    wm_callback_disconnect (cb);
+    return (-1);
+  }
+
+  status = mysql_stmt_prepare (cb->identifier_stmt_select,
+      wm_identifier_statement_select,
+      (unsigned long) strlen (wm_identifier_statement_select));
+  if (status != 0)
+  {
+    ERROR ("write_mysql plugin: mysql_stmt_prepare(\"%s\") failed: %s",
+        wm_identifier_statement_select, mysql_error (cb->conn));
+    wm_callback_disconnect (cb);
+    return (-1);
+  }
+  DEBUG ("write_mysql plugin: Statement prepared: \"%s\"",
+      wm_identifier_statement_select);
+
+  /* Prepare the identifier INSERT statement */
+  cb->identifier_stmt_insert = mysql_stmt_init (cb->conn);
+  if (cb->identifier_stmt_insert == NULL)
+  {
+    ERROR ("write_mysql plugin: mysql_stmt_init() failed: %s",
+        mysql_error (cb->conn));
+    wm_callback_disconnect (cb);
+    return (-1);
+  }
+
+  status = mysql_stmt_prepare (cb->identifier_stmt_insert,
+      wm_identifier_statement_insert,
+      (unsigned long) strlen (wm_identifier_statement_insert));
+  if (status != 0)
+  {
+    ERROR ("write_mysql plugin: mysql_stmt_prepare(\"%s\") failed: %s",
+        wm_identifier_statement_insert, mysql_error (cb->conn));
+    wm_callback_disconnect (cb);
+    return (-1);
+  }
+  DEBUG ("write_mysql plugin: Statement prepared: \"%s\"",
+      wm_identifier_statement_insert);
+
+  return (0);
+} /* }}} int wm_callback_connect */
+
+static void wm_callback_free (void *data) /* {{{ */
+{
+  wm_callback_t *cb = data;
+
+  if (cb == NULL)
+    return;
+
+  wm_callback_disconnect (cb);
+
+  sfree (cb->host);
+  sfree (cb->user);
+  sfree (cb->passwd);
+  sfree (cb->database);
+} /* }}} void wm_callback_free */
+
+static int wm_identifier_cache_lookup (wm_callback_t *cb, /* {{{ */
+    const char *identifier)
+{
+  intptr_t tmp = 0;
+  int status;
+
+  status = c_avl_get (cb->identifier_cache,
+      (const void *) identifier, (void *) &tmp);
+
+  if (status != 0)
+    return (-1);
+  return ((int) tmp);
+} /* }}} int wm_identifier_cache_lookup */
+
+static int wm_identifier_cache_insert (wm_callback_t *cb, /* {{{ */
+    const char *identifier, int id)
+{
+  intptr_t tmp = (intptr_t) id;
+  int status;
+
+  char *key = strdup (identifier);
+  if (key == NULL)
+    return (ENOMEM);
+
+  status = c_avl_insert (cb->identifier_cache,
+      (void *) key, (void *) tmp);
+  if (status != 0)
+    sfree (key);
+
+  return (status);
+} /* }}} int wm_identifier_cache_insert */
+
+static int wm_identifier_database_insert (wm_callback_t *cb, /* {{{ */
+    const value_list_t *vl, const data_set_t *ds, int index)
+{
+  MYSQL_BIND binding[7];
+  char ds_type[DATA_MAX_NAME_LEN];
+  int status;
+  int id;
+
+  status = (int) mysql_stmt_reset (cb->identifier_stmt_insert);
+  if (status != 0)
+  {
+    ERROR ("write_mysql plugin: mysql_stmt_reset failed: %s",
+        mysql_stmt_error (cb->identifier_stmt_insert));
+    return (-1);
+  }
+
+  sstrncpy (ds_type, DS_TYPE_TO_STRING (ds->ds[index].type),
+      sizeof (ds_type));
+
+  memset (binding, 0, sizeof (binding));
+  binding[0].buffer_type = MYSQL_TYPE_STRING;
+  binding[0].buffer_length = (unsigned long) strlen (vl->host);
+  binding[0].buffer = (void *) &vl->host[0];
+  binding[1].buffer_type = MYSQL_TYPE_STRING;
+  binding[1].buffer_length = (unsigned long) strlen (vl->plugin);
+  binding[1].buffer = (void *) &vl->plugin[0];
+  binding[2].buffer_type = MYSQL_TYPE_STRING;
+  binding[2].buffer_length = (unsigned long) strlen (vl->plugin_instance);
+  binding[2].buffer = (void *) &vl->plugin_instance[0];
+  binding[3].buffer_type = MYSQL_TYPE_STRING;
+  binding[3].buffer_length = (unsigned long) strlen (vl->type);
+  binding[3].buffer = (void *) &vl->type[0];
+  binding[4].buffer_type = MYSQL_TYPE_STRING;
+  binding[4].buffer_length = (unsigned long) strlen (vl->type_instance);
+  binding[4].buffer = (void *) &vl->type_instance[0];
+  binding[5].buffer_type = MYSQL_TYPE_STRING;
+  binding[5].buffer_length = (unsigned long) strlen (ds->ds[index].name);
+  binding[5].buffer = (void *) &ds->ds[index].name[0];
+  binding[6].buffer_type = MYSQL_TYPE_STRING;
+  binding[6].buffer_length = (unsigned long) strlen (ds_type);
+  binding[6].buffer = (void *) &ds_type[0];
+
+  status = (int) mysql_stmt_bind_param (cb->identifier_stmt_insert, binding);
+  if (status != 0)
+  {
+    ERROR ("write_mysql plugin: mysql_stmt_bind_param failed: %s",
+        mysql_stmt_error (cb->identifier_stmt_insert));
+    return (-1);
+  }
+
+  status = mysql_stmt_execute (cb->identifier_stmt_insert);
+  if (status != 0)
+  {
+    ERROR ("write_mysql plugin: mysql_stmt_execute failed: %s",
+        mysql_stmt_error (cb->identifier_stmt_insert));
+    return (-1);
+  }
+
+  status = (int) mysql_stmt_affected_rows (cb->identifier_stmt_insert);
+  if (status != 1)
+  {
+    ERROR ("write_mysql plugin: mysql_stmt_affected_rows returned %i, "
+        "expected 1.", status);
+    return (-1);
+  }
+
+  id = (int) mysql_stmt_insert_id (cb->identifier_stmt_insert);
+  DEBUG ("write_mysql plugin: New identifier has ID %i.", id);
+
+  return (id);
+} /* }}} int wm_identifier_database_insert */
+
+static int wm_identifier_database_lookup (wm_callback_t *cb, /* {{{ */
+    const value_list_t *vl, const data_set_t *ds, int index)
+{
+  MYSQL_BIND param_bind[6];
+  MYSQL_BIND return_bind;
+  int id = -1;
+  my_bool id_is_null = 0;
+  unsigned long affected_rows;
+  int status;
+
+  memset (param_bind, 0, sizeof (param_bind));
   param_bind[0].buffer_type = MYSQL_TYPE_STRING;
-  param_bind[0].buffer = (char *) name;
-  param_bind[0].buffer_length = strlen (name);
-  result_bind[0].buffer_type = MYSQL_TYPE_LONG;
-  result_bind[0].buffer = (void *) id;
-  pthread_mutex_lock (&mutexdb);
-  if (mysql_ping (conn) != 0)
-    {
-      ERROR
-	("write_mysql plugin: add_item_id - Failed to re-connect to database : %s",
-	 mysql_error (conn));
-      pthread_mutex_unlock (&mutexdb);
-      return -1;
-    }
-  stmt = mysql_stmt_init (conn);
-  if (mysql_stmt_prepare (stmt, query, strlen (query)) != 0)
-    {
-      ERROR
-	("write_mysql plugin: add_item_id - Failed to prepare statement : %s / %s",
-	 mysql_stmt_error (stmt), query);
-      pthread_mutex_unlock (&mutexdb);
-      return -1;
-    }
-  if (mysql_stmt_bind_param (stmt, param_bind) != 0)
-    {
-      ERROR
-	("write_mysql plugin: add_item_id - Failed to bind param to statement : %s / %s",
-	 mysql_stmt_error (stmt), query);
-      pthread_mutex_unlock (&mutexdb);
-      return -1;
-    }
-  if (mysql_stmt_bind_result (stmt, result_bind) != 0)
-    {
-      ERROR
-	("write_mysql plugin: add_item_id - Failed to bind result to statement : %s / %s",
-	 mysql_stmt_error (stmt), query);
-      pthread_mutex_unlock (&mutexdb);
-      return -1;
-    }
-  if (mysql_stmt_execute (stmt) != 0)
-    {
-      ERROR
-	("write_mysql plugin: add_item_id - Failed to execute re-prepared statement : %s / %s",
-	 mysql_stmt_error (stmt), query);
-      pthread_mutex_unlock (&mutexdb);
-      return -1;
-    }
-  if (mysql_stmt_store_result (stmt) != 0)
-    {
-      ERROR
-	("write_mysql plugin: add_item_id - Failed to store result : %s / %s",
-	 mysql_stmt_error (stmt), query);
-      pthread_mutex_unlock (&mutexdb);
-      return -1;
-    }
-  if (mysql_stmt_fetch (stmt) == 0)
-    {
-      mysql_stmt_free_result (stmt);
-      mysql_stmt_close (stmt);
-      pthread_mutex_unlock (&mutexdb);
-      DEBUG ("get %s_id from DB : %d (%s)",
-	     item == HOST_ITEM ? "host" : item ==
-	     PLUGIN_ITEM ? "plugin" : "type", *id, name);
-    }
-  else
-    {
-      mysql_stmt_free_result (stmt);
-      mysql_stmt_close (stmt);
-      stmt = mysql_stmt_init (conn);
-      ssnprintf (query, sizeof (query), "INSERT INTO %s (name) VALUES (?)",
-		 item == HOST_ITEM ? "host" : item ==
-		 PLUGIN_ITEM ? "plugin" : "type");
-      if (mysql_stmt_prepare (stmt, query, strlen (query)) != 0)
-	{
-	  ERROR
-	    ("write_mysql plugin: add_item_id - Failed to prepare statement : %s / %s",
-	     mysql_stmt_error (stmt), query);
-	  pthread_mutex_unlock (&mutexdb);
-	  return -1;
-	}
-      if (mysql_stmt_bind_param (stmt, param_bind) != 0)
-	{
-	  ERROR
-	    ("write_mysql plugin: add_item_id - Failed to bind param to statement : %s / %s",
-	     mysql_stmt_error (stmt), query);
-	  pthread_mutex_unlock (&mutexdb);
-	  return -1;
-	}
-      if (mysql_stmt_execute (stmt) != 0)
-	{
-	  ERROR
-	    ("write_mysql plugin: add_item_id - Failed to execute re-prepared statement : %s / %s",
-	     mysql_stmt_error (stmt), query);
-	  pthread_mutex_unlock (&mutexdb);
-	  return -1;
-	}
-      *id = mysql_stmt_insert_id (stmt);
-      mysql_stmt_close (stmt);
-      pthread_mutex_unlock (&mutexdb);
-      DEBUG ("insert %s_id in DB : %d (%s)",
-	     item == HOST_ITEM ? "host" : item ==
-	     PLUGIN_ITEM ? "plugin" : "type", *id, name);
-    }
-  switch (item)
-    {
-    case HOST_ITEM:
-      mutex = &mutexhost_tree;
-      tree = host_tree;
-      break;
-    case PLUGIN_ITEM:
-      mutex = &mutexplugin_tree;
-      tree = plugin_tree;
-      break;
-    case TYPE_ITEM:
-      mutex = &mutextype_tree;
-      tree = type_tree;
-      break;
-    }
-  pthread_mutex_lock (mutex);
-  c_avl_insert (tree, strdup (name), (void *) id);
-  pthread_mutex_unlock (mutex);
-  return *id;
-}
+  param_bind[0].buffer_length = (unsigned long) strlen (vl->host);
+  param_bind[0].buffer = (void *) &vl->host[0];
+  param_bind[1].buffer_type = MYSQL_TYPE_STRING;
+  param_bind[1].buffer_length = (unsigned long) strlen (vl->plugin);
+  param_bind[1].buffer = (void *) &vl->plugin[0];
+  param_bind[2].buffer_type = MYSQL_TYPE_STRING;
+  param_bind[2].buffer_length = (unsigned long) strlen (vl->plugin_instance);
+  param_bind[2].buffer = (void *) &vl->plugin_instance[0];
+  param_bind[3].buffer_type = MYSQL_TYPE_STRING;
+  param_bind[3].buffer_length = (unsigned long) strlen (vl->type);
+  param_bind[3].buffer = (void *) &vl->type[0];
+  param_bind[4].buffer_type = MYSQL_TYPE_STRING;
+  param_bind[4].buffer_length = (unsigned long) strlen (vl->type_instance);
+  param_bind[4].buffer = (void *) &vl->type_instance[0];
+  param_bind[5].buffer_type = MYSQL_TYPE_STRING;
+  param_bind[5].buffer_length = (unsigned long) strlen (ds->ds[index].name);
+  param_bind[5].buffer = (void *) &ds->ds[index].name[0];
 
-static int
-add_dataset_id (data_source_t * ds, int type_id)
+  status = (int) mysql_stmt_bind_param (cb->identifier_stmt_select,
+      param_bind);
+  if (status != 0)
+  {
+    ERROR ("write_mysql plugin: mysql_stmt_bind_param failed: %s",
+        mysql_stmt_error (cb->identifier_stmt_select));
+    return (-1);
+  }
+
+  /* Bind output buffers */
+  memset (&return_bind, 0, sizeof (return_bind));
+  return_bind.buffer_type = MYSQL_TYPE_LONG;
+  return_bind.buffer = (void *) &id;
+  return_bind.buffer_length = sizeof (id);
+  return_bind.is_null = &id_is_null;
+
+  status = (int) mysql_stmt_bind_result (cb->identifier_stmt_select,
+      &return_bind);
+  if (status != 0)
+  {
+    ERROR ("write_mysql plugin: mysql_stmt_bind_result failed: %s",
+        mysql_stmt_error (cb->identifier_stmt_select));
+    return (-1);
+  }
+
+  /* Execute statement */
+  DEBUG ("write_mysql plugin: Executing identifier_stmt_select.");
+  status = mysql_stmt_execute (cb->identifier_stmt_select);
+  if (status != 0)
+  {
+    ERROR ("write_mysql plugin: mysql_stmt_execute failed: %s",
+        mysql_stmt_error (cb->identifier_stmt_select));
+    return (-1);
+  }
+
+  /* Fetch all results, otherwise mysql_stmt_num_rows() is not available. */
+  status = mysql_stmt_store_result (cb->identifier_stmt_select);
+  if (status != 0)
+  {
+    ERROR ("write_mysql plugin: mysql_stmt_store_result failed: %s",
+        mysql_stmt_error (cb->identifier_stmt_select));
+    mysql_stmt_free_result (cb->identifier_stmt_select);
+    return (-1);
+  }
+
+  affected_rows = (unsigned long) mysql_stmt_num_rows (
+      cb->identifier_stmt_select);
+  DEBUG ("write_mysql plugin: identifier_stmt_select returned %lu row(s).",
+      affected_rows);
+  if (affected_rows == 0)
+  {
+    mysql_stmt_free_result (cb->identifier_stmt_select);
+    return (wm_identifier_database_insert (cb, vl, ds, index));
+  }
+  else if (affected_rows > 1)
+  {
+    ERROR ("write_mysql plugin: Looking up an identifier id returned %lu "
+        "results.", affected_rows);
+    mysql_stmt_free_result (cb->identifier_stmt_select);
+    return (-1);
+  }
+
+  /* Copy value to the provided buffer "id". */
+  status = mysql_stmt_fetch (cb->identifier_stmt_select);
+  if (status != 0)
+  {
+    ERROR ("write_mysql plugin: mysql_stmt_fetch failed: %s",
+        mysql_stmt_error (cb->identifier_stmt_select));
+    mysql_stmt_free_result (cb->identifier_stmt_select);
+    return (-1);
+  }
+  DEBUG ("write_mysql plugin: id = %i; id_is_null = %i;",
+      id, (int) id_is_null);
+
+  mysql_stmt_free_result (cb->identifier_stmt_select);
+
+  if (id_is_null)
+  {
+    /* XXX: If this ever fires at all, it will fire for *every* write
+     * to this ID. */
+    ERROR ("write_mysql plugin: NULL identifier id returned.");
+    return (-1);
+  }
+
+  return (id);
+} /* }}} int wm_identifier_database_lookup */
+
+static int wm_identifier_to_id (wm_callback_t *cb, /* {{{ */
+    const value_list_t *vl, const data_set_t *ds, int index)
 {
-  int *id = malloc (sizeof (int));
-  char tree_key[DATA_MAX_NAME_LEN * 2];
-  dataset_t *newdataset;
-  char *type;
-  switch (ds->type)
-    {
-    case DS_TYPE_COUNTER:
-      type = "COUNTER";
-      break;
-    case DS_TYPE_DERIVE:
-      type = "DERIVE";
-      break;
-    case DS_TYPE_ABSOLUTE:
-      type = "ABSOLUTE";
-      break;
-    default:
-      type = "GAUGE";
-      break;
-    }
-  char *query = "SELECT id FROM dataset WHERE name = ? AND type_id = ?";
-  MYSQL_BIND param_bind[2], result_bind[1], param_bind2[5];
-  MYSQL_STMT *stmt;
-  memset (param_bind, '\0', sizeof (MYSQL_BIND) * 2);
-  memset (param_bind2, '\0', sizeof (MYSQL_BIND) * 5);
-  memset (result_bind, '\0', sizeof (MYSQL_BIND));
-  param_bind[0].buffer_type = MYSQL_TYPE_STRING;
-  param_bind[0].buffer = (char *) ds->name;
-  param_bind[0].buffer_length = strlen (ds->name);
-  param_bind[1].buffer_type = MYSQL_TYPE_LONG;
-  param_bind[1].buffer = (void *) &type_id;
-  param_bind2[0].buffer_type = MYSQL_TYPE_STRING;
-  param_bind2[0].buffer = (char *) ds->name;
-  param_bind2[0].buffer_length = strlen (ds->name);
-  param_bind2[1].buffer_type = MYSQL_TYPE_LONG;
-  param_bind2[1].buffer = (void *) &type_id;
-  param_bind2[2].buffer_type = MYSQL_TYPE_STRING;
-  param_bind2[2].buffer = (char *) &type;
-  param_bind2[2].buffer_length = strlen (type);
-  param_bind2[3].buffer_type = MYSQL_TYPE_DOUBLE;
-  param_bind2[3].buffer = (void *) &ds->min;
-  param_bind2[4].buffer_type = MYSQL_TYPE_DOUBLE;
-  param_bind2[4].buffer = (void *) &ds->max;
-  result_bind[0].buffer_type = MYSQL_TYPE_LONG;
-  result_bind[0].buffer = (void *) id;
-  pthread_mutex_lock (&mutexdb);
-  if (mysql_ping (conn) != 0)
-    {
-      ERROR
-	("write_mysql plugin: add_dataset_id - Failed to re-connect to database : %s",
-	 mysql_error (conn));
-      pthread_mutex_unlock (&mutexdb);
-      return -1;
-    }
-  stmt = mysql_stmt_init (conn);
-  if (mysql_stmt_prepare (stmt, query, strlen (query)) != 0)
-    {
-      ERROR
-	("write_mysql plugin: add_dataset_id - Failed to prepare statement : %s / %s",
-	 mysql_stmt_error (stmt), query);
-      pthread_mutex_unlock (&mutexdb);
-      return -1;
-    }
-  if (mysql_stmt_bind_param (stmt, param_bind) != 0)
-    {
-      ERROR
-	("write_mysql plugin: add_dataset_id - Failed to bind param to statement : %s / %s",
-	 mysql_stmt_error (stmt), query);
-      pthread_mutex_unlock (&mutexdb);
-      return -1;
-    }
-  if (mysql_stmt_bind_result (stmt, result_bind) != 0)
-    {
-      ERROR
-	("write_mysql plugin: add_dataset_id - Failed to bind result to statement : %s / %s",
-	 mysql_stmt_error (stmt), query);
-      pthread_mutex_unlock (&mutexdb);
-      return -1;
-    }
-  if (mysql_stmt_execute (stmt) != 0)
-    {
-      ERROR
-	("write_mysql plugin: add_dataset_id - Failed to execute re-prepared statement : %s / %s",
-	 mysql_stmt_error (stmt), query);
-      pthread_mutex_unlock (&mutexdb);
-      return -1;
-    }
-  if (mysql_stmt_store_result (stmt) != 0)
-    {
-      ERROR
-	("write_mysql plugin: add_dataset_id - Failed to store result : %s / %s",
-	 mysql_stmt_error (stmt), query);
-      pthread_mutex_unlock (&mutexdb);
-      return -1;
-    }
-  if (mysql_stmt_fetch (stmt) == 0)
-    {
-      mysql_stmt_free_result (stmt);
-      mysql_stmt_close (stmt);
-      pthread_mutex_unlock (&mutexdb);
-      DEBUG ("get dataset_id from DB : %d (%s) (%d)", *id, ds->name, type_id);
-    }
-  else
-    {
-      mysql_stmt_free_result (stmt);
-      mysql_stmt_close (stmt);
-      stmt = mysql_stmt_init (conn);
-      char *queryins =
-	"INSERT INTO dataset (name,type_id,type,min,max) VALUES (?,?,?,?,?)";
-      if (mysql_stmt_prepare (stmt, queryins, strlen (queryins)) != 0)
-	{
-	  ERROR
-	    ("write_mysql plugin: add_dataset_id - Failed to prepare statement : %s / %s",
-	     mysql_stmt_error (stmt), queryins);
-	  pthread_mutex_unlock (&mutexdb);
-	  return -1;
-	}
-      if (mysql_stmt_bind_param (stmt, param_bind2) != 0)
-	{
-	  ERROR
-	    ("write_mysql plugin: add_dataset_id - Failed to bind param to statement : %s / %s",
-	     mysql_stmt_error (stmt), queryins);
-	  pthread_mutex_unlock (&mutexdb);
-	  return -1;
-	}
-      if (mysql_stmt_execute (stmt) != 0)
-	{
-	  ERROR
-	    ("write_mysql plugin: add_dataset_id - Failed to execute re-prepared statement : %s / %s",
-	     mysql_stmt_error (stmt), queryins);
-	  pthread_mutex_unlock (&mutexdb);
-	  return -1;
-	}
-      *id = mysql_stmt_insert_id (stmt);
-      mysql_stmt_close (stmt);
-      pthread_mutex_unlock (&mutexdb);
-      DEBUG ("insert dataset_id in DB : %d (%s) (%d)", *id, ds->name,
-	     type_id);
-    }
-  pthread_mutex_unlock (&mutexdb);
-  ssnprintf (tree_key, sizeof (tree_key), "%s_%d", ds->name, type_id);
-  newdataset = malloc (sizeof (dataset_t));
-  sstrncpy (newdataset->name, ds->name, sizeof (newdataset->name));
-  newdataset->id = *id;
-  newdataset->type_id = type_id;
-  pthread_mutex_lock (&mutexdataset_tree);
-  c_avl_insert (dataset_tree, strdup (tree_key), newdataset);
-  pthread_mutex_unlock (&mutexdataset_tree);
-  sfree (id);
-  return newdataset->id;
+  char tmp[6 * DATA_MAX_NAME_LEN];
+  char identifier[7 * DATA_MAX_NAME_LEN];
+  int status;
 
-}
+  status = FORMAT_VL (tmp, sizeof (tmp), vl);
+  if (status != 0)
+    return (-1);
 
-static int
-get_item_id (const char *name, const int item)
-{
-  int *id;
-  pthread_mutex_t *mutex;
-  c_avl_tree_t *tree;
-  switch (item)
-    {
-    case HOST_ITEM:
-      mutex = &mutexhost_tree;
-      tree = host_tree;
-      break;
-    case PLUGIN_ITEM:
-      mutex = &mutexplugin_tree;
-      tree = plugin_tree;
-      break;
-    case TYPE_ITEM:
-      mutex = &mutextype_tree;
-      tree = type_tree;
-      break;
-    }
-  if (strlen (name) == 0)
-    {
-      return -1;
-    }
-  pthread_mutex_lock (mutex);
-  if (c_avl_get (tree, name, (void *) &id) == 0)
-    {
-      pthread_mutex_unlock (mutex);
-      DEBUG ("get_item_id : get %s_id for %s from cache",
-	     item == HOST_ITEM ? "host" : item ==
-	     PLUGIN_ITEM ? "plugin" : "type", name);
-      return *id;
-    }
-  else
-    {
-      pthread_mutex_unlock (mutex);
-      DEBUG ("get_item_id : insert %s_id for %s into cache",
-	     item == HOST_ITEM ? "host" : item ==
-	     PLUGIN_ITEM ? "plugin" : "type", name);
-      return add_item_id (name, item);
-    }
-}
+  (void) ssnprintf (identifier, sizeof (identifier),
+      "%s/%s", tmp, ds->ds[index].name);
 
-static int
-get_dataset_id (data_source_t * ds, int type_id)
-{
-  char tree_key[DATA_MAX_NAME_LEN * 2];
-  dataset_t *newdataset;
-  ssnprintf (tree_key, sizeof (tree_key), "%s_%d", ds->name, type_id);
-  pthread_mutex_lock (&mutexdataset_tree);
-  if (c_avl_get (dataset_tree, tree_key, (void *) &newdataset) == 0)
-    {
-      pthread_mutex_unlock (&mutexdataset_tree);
-      DEBUG ("dataset_id from cache : %d | %s", newdataset->id, tree_key);
-      return newdataset->id;
-    }
+  pthread_mutex_lock (&cb->identifier_lock);
+
+  status = wm_identifier_cache_lookup (cb, identifier);
+  if (status >= 0) /* likely */
+  {
+    pthread_mutex_unlock (&cb->identifier_lock);
+    return (status);
+  }
   else
-    {
-      pthread_mutex_unlock (&mutexdataset_tree);
-      return add_dataset_id (ds, type_id);
-    }
-}
+  {
+    DEBUG ("write_mysql plugin: Identifier \"%s\" not found in the cache.",
+        identifier);
+  }
+
+  status = wm_identifier_database_lookup (cb, vl, ds, index);
+  if (status >= 0)
+    wm_identifier_cache_insert (cb, identifier, status);
+
+  pthread_mutex_unlock (&cb->identifier_lock);
+
+  return (status);
+} /* }}} int wm_identifier_to_id */
 
 static int wm_cdtime_t_to_mysql_time (cdtime_t in, MYSQL_TIME *out) /* {{{ */
 {
@@ -533,237 +568,167 @@ static int wm_cdtime_t_to_mysql_time (cdtime_t in, MYSQL_TIME *out) /* {{{ */
   return (0);
 } /* }}} int wm_cdtime_t_to_mysql_time */
 
-static int
-write_mysql_write (const data_set_t * ds, const value_list_t * vl,
-		   user_data_t __attribute__ ((unused)) * user_data)
+static int wm_write_locked (wm_callback_t *cb, /* {{{ */
+    const data_set_t *ds, const value_list_t *vl,
+    gauge_t *rates)
 {
+  MYSQL_TIME vl_time;
+  MYSQL_BIND param_bind[3];
+  int status;
   int i;
-  int host_id, plugin_id, type_id, aa;
-  gauge_t *rates = NULL;
 
-  host_id = get_item_id ((char *) vl->host, HOST_ITEM);
-  plugin_id = get_item_id ((char *) vl->plugin, PLUGIN_ITEM);
-  type_id = get_item_id ((char *) vl->type, TYPE_ITEM);
-  if (host_id == -1 || plugin_id == -1 || type_id == -1)
-    {
-      return -1;
-    }
+  status = wm_callback_connect (cb);
+  if (status != 0)
+  {
+    ERROR ("write_mysql plugin: Unable to connect.");
+    return (status);
+  }
+
+  status = wm_cdtime_t_to_mysql_time (vl->time, &vl_time);
+  if (status != 0)
+  {
+    char errbuf[1024];
+    ERROR ("write_mysql plugin: wm_cdtime_t_to_mysql_time failed: %s.",
+        sstrerror (errno, errbuf, sizeof (errbuf)));
+    return (status);
+  }
 
   for (i = 0; i < ds->ds_num; i++)
+  {
+    int dataset_id;
+
+    dataset_id = wm_identifier_to_id (cb, vl, ds, i);
+    if (dataset_id < 0)
+      continue;
+
+    memset (param_bind, 0, sizeof (param_bind));
+    param_bind[0].buffer_type = MYSQL_TYPE_LONG;
+    param_bind[0].buffer_length = 0;
+    param_bind[0].buffer = (void *) &dataset_id;
+    param_bind[1].buffer_type = MYSQL_TYPE_DATETIME;
+    param_bind[1].buffer_length = 0;
+    param_bind[1].buffer = (void *) &vl_time;
+    param_bind[2].buffer_type = MYSQL_TYPE_DOUBLE;
+    param_bind[2].buffer_length = 0;
+    param_bind[2].buffer = rates + i;
+
+    status = (int) mysql_stmt_bind_param (cb->data_stmt, param_bind);
+    if (status != 0)
     {
-      int len;
-      data_source_t *dsrc = ds->ds + i;
-      int dataset_id = get_dataset_id (dsrc, type_id);
-      MYSQL_BIND binding[8];
-      MYSQL_TIME mysql_date;
-
-      if (dataset_id == -1)
-        return -1;
-
-      wm_cdtime_t_to_mysql_time (vl->time, &mysql_date);
-
-      memset (binding, 0, sizeof (binding));
-      binding[0].buffer_type = MYSQL_TYPE_DATETIME;
-      binding[0].buffer = (char *) &mysql_date;
-      binding[1].buffer_type = MYSQL_TYPE_LONG;
-      binding[1].buffer = (void *) &host_id;
-      binding[2].buffer_type = MYSQL_TYPE_LONG;
-      binding[2].buffer = (void *) &plugin_id;
-      binding[3].buffer_type = MYSQL_TYPE_STRING;
-      binding[3].buffer = (void *) vl->plugin_instance;
-      binding[3].buffer_length = strlen (vl->plugin_instance);
-      binding[4].buffer_type = MYSQL_TYPE_LONG;
-      binding[4].buffer = (void *) &type_id;
-      binding[5].buffer_type = MYSQL_TYPE_STRING;
-      binding[5].buffer = (void *) vl->type_instance;
-      binding[5].buffer_length = strlen (vl->type_instance);
-      binding[6].buffer_type = MYSQL_TYPE_LONG;
-      binding[6].buffer = (void *) &dataset_id;
-      if (dsrc->type == DS_TYPE_GAUGE)
-	{
-	  binding[7].buffer_type = MYSQL_TYPE_DOUBLE;
-	  binding[7].buffer = (void *) &(vl->values[i].gauge);
-
-	}
-      else
-	{
-	  if (rates == NULL)
-	    {
-	      rates = uc_get_rate (ds, vl);
-	    }
-	  if (rates == NULL)
-	    {
-	      sfree (rates);
-	      continue;
-	    }
-	  binding[7].buffer_type = MYSQL_TYPE_DOUBLE;
-	  binding[7].buffer = (void *) &(rates[i]);
-	}
-
-      pthread_mutex_lock (&mutexdb);
-
-      if (mysql_ping (conn) != 0)
-	{
-	  ERROR
-	    ("write_mysql plugin: write_mysql_write - Failed to re-connect to database : %s",
-	     mysql_error (conn));
-	  pthread_mutex_unlock (&mutexdb);
-	  sfree (rates);
-	  return -1;
-	}
-      if (mysql_stmt_bind_param (data_stmt, binding) != 0)
-	{
-	  ERROR
-	    ("write_mysql plugin: Failed to bind param to statement : %s / %s",
-	     mysql_stmt_error (data_stmt), data_query);
-	  pthread_mutex_unlock (&mutexdb);
-	  sfree (rates);
-	  return -1;
-	}
-      if (mysql_stmt_execute (data_stmt) != 0)
-	{
-	  // Try to re-prepare statement
-	  data_stmt = mysql_stmt_init (conn);
-	  mysql_stmt_prepare (data_stmt, data_query, strlen (data_query));
-	  mysql_stmt_bind_param (data_stmt, binding);
-	  if (mysql_stmt_execute (data_stmt) != 0)
-	    {
-	      ERROR
-		("write_mysql plugin: Failed to execute re-prepared statement : %s / %s",
-		 mysql_stmt_error (data_stmt), data_query);
-	      pthread_mutex_unlock (&mutexdb);
-	      sfree (rates);
-	      return -1;
-	    }
-	}
-      sfree (rates);
-      pthread_mutex_unlock (&mutexdb);
+      ERROR ("write_mysql plugin: mysql_stmt_bind_param failed: %s",
+          mysql_stmt_error (cb->data_stmt));
+      return (-1);
     }
+
+    status = mysql_stmt_execute (cb->data_stmt);
+    if (status != 0)
+    {
+      ERROR ("write_mysql plugin: mysql_stmt_execute failed: %s",
+          mysql_stmt_error (cb->data_stmt));
+      return (-1);
+    }
+  } /* for (ds->ds) */
+
   return (0);
-}
+} /* }}} wm_write_locked */
 
-static int
-notify_write_mysql (const notification_t * n,
-		    user_data_t __attribute__ ((unused)) * user_data)
+static int wm_write (const data_set_t *ds, const value_list_t *vl, /* {{{ */
+    user_data_t *user_data)
 {
+  wm_callback_t *cb = user_data->data;
+  gauge_t *rates;
+  int status;
 
-  int host_id, plugin_id, type_id, len;
-  char severity[32];
-  MYSQL_TIME mysql_date;
+  assert (cb != NULL);
 
-  host_id = get_item_id (n->host, HOST_ITEM);
-  plugin_id = get_item_id (n->plugin, PLUGIN_ITEM);
-  type_id = get_item_id (n->type, TYPE_ITEM);
+  rates = uc_get_rate (ds, vl);
+  if (rates == NULL)
+    return (-1);
 
-  wm_cdtime_t_to_mysql_time (n->time, &mysql_date);
+  pthread_mutex_lock (&cb->conn_lock);
+  status = wm_write_locked (cb, ds, vl, rates);
+  pthread_mutex_unlock (&cb->conn_lock);
 
-  memset (notif_bind, 0, sizeof (notif_bind));
+  sfree (rates);
 
-  pthread_mutex_lock (&mutexdb);
+  return (status);
+} /* }}} int wm_write */
 
-  notif_bind[0].buffer_type = MYSQL_TYPE_DATETIME;
-  notif_bind[0].buffer = (char *) &mysql_date;
-  notif_bind[0].is_null = 0;
-  notif_bind[0].length = 0;
-  notif_bind[1].buffer_type = MYSQL_TYPE_LONG;
-  notif_bind[1].buffer = (void *) &host_id;
-  notif_bind[2].buffer_type = MYSQL_TYPE_LONG;
-  notif_bind[2].buffer = (void *) &plugin_id;
-  notif_bind[3].buffer_type = MYSQL_TYPE_STRING;
-  notif_bind[3].buffer = (void *) n->plugin_instance;
-  notif_bind[3].buffer_length = strlen (n->plugin_instance);
-  notif_bind[4].buffer_type = MYSQL_TYPE_LONG;
-  notif_bind[4].buffer = (void *) &type_id;
-  notif_bind[5].buffer_type = MYSQL_TYPE_STRING;
-  notif_bind[5].buffer = (void *) n->type_instance;
-  notif_bind[5].buffer_length = strlen (n->type_instance);
-  notif_bind[6].buffer_type = MYSQL_TYPE_STRING;
-  ssnprintf (severity, sizeof (severity), "%s",
-	     (n->severity == NOTIF_FAILURE) ? "FAILURE"
-	     : ((n->severity == NOTIF_WARNING) ? "WARNING"
-		: ((n->severity == NOTIF_OKAY) ? "OKAY" : "UNKNOWN")));
-  notif_bind[6].buffer = (void *) severity;
-  notif_bind[6].buffer_length = strlen (severity);
-  notif_bind[7].buffer_type = MYSQL_TYPE_VAR_STRING;
-  notif_bind[7].buffer = (void *) n->message;
-  notif_bind[7].buffer_length = strlen (n->message);
-  if (mysql_ping (conn) != 0)
-    {
-      ERROR
-	("write_mysql plugin: write_mysql_write - Failed to re-connect to database : %s",
-	 mysql_error (conn));
-      pthread_mutex_unlock (&mutexdb);
-      return -1;
-    }
-  if (mysql_stmt_bind_param (notif_stmt, notif_bind) != 0)
-    {
-      ERROR
-	("write_mysql plugin: Failed to bind param to statement : %s / %s",
-	 mysql_stmt_error (notif_stmt), notif_query);
-      pthread_mutex_unlock (&mutexdb);
-      return -1;
-    }
-
-  if (mysql_stmt_execute (notif_stmt) != 0)
-    {
-      // Try to re-prepare statement
-      notif_stmt = mysql_stmt_init (conn);
-      mysql_stmt_prepare (notif_stmt, notif_query, strlen (notif_query));
-      mysql_stmt_bind_param (notif_stmt, notif_bind);
-      if (mysql_stmt_execute (notif_stmt) != 0)
-	{
-	  ERROR
-	    ("write_mysql plugin: Failed to execute re-prepared statement : %s / %s",
-	     mysql_stmt_error (notif_stmt), notif_query);
-	  pthread_mutex_unlock (&mutexdb);
-	  return -1;
-	}
-    }
-  pthread_mutex_unlock (&mutexdb);
-  return 0;
-}
-
-static void
-free_tree (c_avl_tree_t * tree)
+static int wm_config_instance (const oconfig_item_t *ci) /* {{{ */
 {
-  void *key = NULL;
-  void *value = NULL;
+  wm_callback_t *cb;
+  user_data_t user_data;
+  char callback_name[DATA_MAX_NAME_LEN];
+  int i;
 
-  if (tree == NULL)
+  cb = malloc (sizeof (*cb));
+  if (cb == NULL)
+  {
+    ERROR ("write_mysql plugin: malloc(3) failed.");
+    return (ENOMEM);
+  }
+  wm_callback_init (cb);
+
+  for (i = 0; i < ci->children_num; i++)
+  {
+    const oconfig_item_t *child = ci->children + i;
+
+    if (strcasecmp ("Host", child->key) == 0)
+      cf_util_get_string (child, &cb->host);
+    else if (strcasecmp ("Port", child->key) == 0)
     {
-      return;
+      int tmp = cf_util_get_port_number (child);
+      if (tmp > 0)
+        cb->port = tmp;
     }
-  while (c_avl_pick (tree, &key, &value) == 0)
-    {
-      sfree (key);
-      sfree (value);
-      key = NULL;
-      value = NULL;
-    }
-  c_avl_destroy (tree);
-  tree = NULL;
+    else if (strcasecmp ("User", child->key) == 0)
+      cf_util_get_string (child, &cb->user);
+    else if (strcasecmp ("Password", child->key) == 0)
+      cf_util_get_string (child, &cb->passwd);
+    else if (strcasecmp ("Database", child->key) == 0)
+      cf_util_get_string (child, &cb->database);
+    else
+      ERROR ("write_mysql plugin: The config option \"%s\" "
+          "is not allowed in \"Instance\" blocks.", child->key);
+  }
+
+  /* TODO: Sanity checking */
+
+  cb->identifier_cache = c_avl_create ((void *) strcmp);
+  assert (cb->identifier_cache != NULL);
+
+  ssnprintf (callback_name, sizeof (callback_name), "write_mysql/%s/%i",
+      cb->host, cb->port);
+
+  memset (&user_data, 0, sizeof (user_data));
+  user_data.data = cb;
+  user_data.free_func = wm_callback_free;
+  plugin_register_write (callback_name, wm_write, &user_data);
+
+  return (0);
+} /* }}} int wm_config_instance */
+
+static int wm_config (oconfig_item_t *ci) /* {{{ */
+{
+  int i;
+
+  for (i = 0; i < ci->children_num; i++)
+  {
+    const oconfig_item_t *child = ci->children + i;
+
+    if (strcasecmp ("Instance", child->key) == 0)
+      wm_config_instance (child);
+    else
+      ERROR ("write_mysql plugin: The config option \"%s\" "
+          "is not allowed here.", child->key);
+  }
+
+  return (0);
+} /* }}} int wm_config */
+
+void module_register (void)
+{
+  plugin_register_complex_config ("write_mysql", wm_config);
 }
 
-static int
-write_mysql_shutdown (void)
-{
-  free_tree (host_tree);
-  free_tree (plugin_tree);
-  free_tree (type_tree);
-  free_tree (dataset_tree);
-  mysql_close (conn);
-  return 0;
-}
-
-void
-module_register (void)
-{
-  plugin_register_init ("write_mysql", write_mysql_init);
-  plugin_register_config ("write_mysql", write_mysql_config,
-			  config_keys, config_keys_num);
-  plugin_register_write ("write_mysql", write_mysql_write, /* user_data = */
-			 NULL);
-  plugin_register_shutdown ("write_mysql", write_mysql_shutdown);
-  plugin_register_notification ("write_mysql", notify_write_mysql,
-				/* user_data = */ NULL);
-}
+/* vim: set sw=2 sts=2 et fdm=marker : */

@@ -980,11 +980,13 @@
 #</Plugin>
 
 #<Plugin write_mysql>
-#	Host "localhost"
-#	User "root"
-#	Passwd ""
-#	Database "collectd"
-#	Port "3306"
+#  <Instance>
+#    Host "localhost"
+#    Port "3306"
+#    User "collectd"
+#    Password ""
+#    Database "collectd_write_mysql"
+#  </Instance>
 #</Plugin>
 
 #<Plugin write_redis>

@@ -261,10 +261,8 @@ pkglib_LTLIBRARIES += write_mysql.la
 write_mysql_la_SOURCES = write_mysql.c
 write_mysql_la_LDFLAGS = -module -avoid-version
 collectd_LDADD += "-dlopen" write_mysql.la
-if BUILD_WITH_LIBMYSQL
-write_mysql_la_CFLAGS = $(BUILD_WITH_LIBMYSQL_CFLAGS)
+write_mysql_la_CFLAGS = $(AM_CFLAGS) $(BUILD_WITH_LIBMYSQL_CFLAGS)
 write_mysql_la_LIBADD = $(BUILD_WITH_LIBMYSQL_LIBS) -lmysqlclient_r
-endif
 collectd_DEPENDENCIES += write_mysql.la
 endif
 
