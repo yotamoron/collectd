@@ -380,7 +380,7 @@ sub putval
 	return;
 } # putval
 
-=item I<$res> = I<$obj>-E<gt>B<listval> ()
+=item I<$res> = I<$obj>-E<gt>B<listval> (I<%selection>)
 
 Queries a list of values from the daemon. The list is returned as an array of
 hash references, where each hash reference is a valid identifier. The C<time>
@@ -391,13 +391,29 @@ member of each hash holds the epoch value of the last update of that value.
 sub listval
 {
 	my $obj = shift;
+	my %args = @_;
 	my $msg;
 	my @ret = ();
 	my $status;
 	my $fh = $obj->{'sock'} or confess;
 
-	_debug "LISTVAL\n";
-	print $fh "LISTVAL\n";
+	my $cmd = 'LISTVAL';
+	for (sort (keys %args))
+	{
+		my $key = $_;
+		my $val = _escape_argument ($args{$key});
+
+		if ($key =~ m/\W/)
+		{
+			$obj->{'error'} = "Option \"$key\" is invalid.";
+			return;
+		}
+
+		$cmd .= " $key=$val";
+	}
+
+	_debug "$cmd\n";
+	print $fh "$cmd\n";
 
 	$msg = <$fh>;
 	chomp ($msg);
